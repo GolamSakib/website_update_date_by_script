@@ -7,6 +7,15 @@ the script:
   1. Extracts the topic title after the number prefix
   2. Finds the matching <a title="..."> link on the MOWR homepage
   3. Fetches that page and reads the date from div.content-update-block > p
+
+     SPECIAL CASE: if the topic title is "ই-সেবাসমূহের তালিকা" or
+     "মন্ত্রণালয়/বিভাগ সম্পর্কিত কমিটিসমূহ", step 3 is different:
+       3a. Open the matched page
+       3b. Find every <td> that has BOTH classes "table-td" and "centered"
+       3c. Open every link found inside those cells, one by one
+       3d. Read each sub-page's div.content-update-block date
+       3e. Keep the MOST RECENT date among all of them
+
   4. Writes the date (dd/mm/yyyy in Bengali numerals) into column
      "সর্বশেষ হালনাগাদের তারিখ" using Nikosh 14pt, centered
   5. Applies the same font, size, and alignment to every data cell in that
@@ -21,6 +30,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urljoin
@@ -237,7 +247,12 @@ def prefer_mowr_link(links: list[SiteLink]) -> SiteLink:
     return internal[0] if internal else links[0]
 
 
-def parse_update_paragraph(text: str) -> Optional[str]:
+# ---------------------------------------------------------------------------
+# Date parsing / formatting
+# ---------------------------------------------------------------------------
+
+def parse_update_date_value(text: str) -> Optional[date]:
+    """Parse a date out of an update paragraph and return a real date object."""
     match = UPDATE_DATE_RE.search(text)
     if not match:
         return None
@@ -254,10 +269,28 @@ def parse_update_paragraph(text: str) -> Optional[str]:
     if month is None:
         return None
 
-    return f"{en_to_bn(day, 2)}/{en_to_bn(month, 2)}/{en_to_bn(year, 4)}"
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
 
 
-def fetch_update_date(session: requests.Session, url: str) -> Optional[str]:
+def format_bengali_date(value: date) -> str:
+    return f"{en_to_bn(value.day, 2)}/{en_to_bn(value.month, 2)}/{en_to_bn(value.year, 4)}"
+
+
+def parse_update_paragraph(text: str) -> Optional[str]:
+    """Kept for backward compatibility: returns the Bengali-formatted string."""
+    value = parse_update_date_value(text)
+    return format_bengali_date(value) if value else None
+
+
+# ---------------------------------------------------------------------------
+# Fetching
+# ---------------------------------------------------------------------------
+
+def fetch_update_date_value(session: requests.Session, url: str) -> Optional[date]:
+    """Fetch a page and return its content-update-block date as a date object."""
     response = session.get(url, timeout=45, verify=False)
     response.raise_for_status()
     response.encoding = "utf-8"
@@ -271,8 +304,104 @@ def fetch_update_date(session: requests.Session, url: str) -> Optional[str]:
     if not paragraph:
         return None
 
-    return parse_update_paragraph(paragraph.get_text(" ", strip=True))
+    return parse_update_date_value(paragraph.get_text(" ", strip=True))
 
+
+def fetch_update_date(session: requests.Session, url: str) -> Optional[str]:
+    """Fetch a page and return its content-update-block date, Bengali-formatted."""
+    value = fetch_update_date_value(session, url)
+    return format_bengali_date(value) if value else None
+
+
+# Topics that require the "open every linked sub-page, take the latest date"
+# logic instead of reading a single content-update-block directly.
+# Both the correct spelling and the "সম্পর্কত" variant are accepted.
+SPECIAL_MULTI_LINK_TITLES = {
+    normalize_title("ই-সেবাসমূহের তালিকা"),
+    normalize_title("মন্ত্রণালয়/বিভাগ সম্পর্কিত কমিটিসমূহ"),
+    normalize_title("সকল ফোকাল পয়েন্ট"),
+    normalize_title("সভার কার্যবিবরণী"),
+    normalize_title("সভার বিজ্ঞপ্তি"),
+    normalize_title("সাংগঠনিক কাঠামো"),
+    normalize_title("বিদেশ ভ্রমণের জি.ও"),
+    normalize_title("বহিঃ বাংলাদেশ ছুটি"),
+    normalize_title("পাসপোর্ট অনাপত্তি পত্র"),
+    normalize_title("প্রজ্ঞাপন/ অফিস আদেশ / পরিপত্র"),
+    normalize_title("আইন ও বিধিমালা"),
+    normalize_title("নীতিমালা"),
+    normalize_title("খসড়া"),
+    normalize_title("অন্যান্য"),
+    normalize_title("ত্রৈমাসিক/বার্ষিক পরিবীক্ষণ/মূল্যায়ন প্রতিবেদন"),
+    normalize_title("কর্মপরিকল্পনা/পরিবীক্ষণ ও মূল্যায়ন প্রতিবেদন"),
+    normalize_title("কর্মপরিকল্পনা /নির্দেশিকা/প্রকল্পসমূহ"),
+    normalize_title("বার্ষিক ক্রয় পরিকল্পনা"),
+    normalize_title("বাজেট ও এমটিবিএফ বাজেট"),
+    normalize_title("টেন্ডার / কোটেশন / নিলাম"),
+    normalize_title("নিয়োগ সংক্রান্ত সকল তথ্য"),
+    normalize_title("বিশ্ব পানি দিবস"),
+    normalize_title("বার্ষিক প্রতিবেদন"),
+    normalize_title("কমিটিসমূহ"),
+    normalize_title("ফোকাল পয়েন্ট ও অন্যান্য")
+}
+
+
+def fetch_most_recent_date_from_subpages(
+    session: requests.Session,
+    page_url: str,
+    delay_seconds: float = 0.4,
+) -> Optional[date]:
+    """
+    Open page_url, collect every link inside <td class="table-td centered">
+    cells, visit each linked page, and return the most recent
+    content-update-block date found among them.
+    """
+    response = session.get(page_url, timeout=45, verify=False)
+    response.raise_for_status()
+    response.encoding = "utf-8"
+    soup = BeautifulSoup(response.text, "html.parser")
+
+    # Elements that have BOTH classes "table-td" and "centered".
+    table_cells = soup.select("td.table-td.centered")
+
+    sub_urls: list[str] = []
+    seen_urls: set[str] = set()
+    for cell in table_cells:
+        for anchor in cell.find_all("a", href=True):
+            href = anchor["href"].strip()
+            if not href or href == "#":
+                continue
+            absolute_url = urljoin(page_url, href)
+            if absolute_url in seen_urls:
+                continue
+            seen_urls.add(absolute_url)
+            sub_urls.append(absolute_url)
+
+    print(f"    Found {len(sub_urls)} link(s) inside td.table-td.centered cells.")
+
+    latest_date: Optional[date] = None
+    for index, sub_url in enumerate(sub_urls, start=1):
+        try:
+            value = fetch_update_date_value(session, sub_url)
+        except requests.RequestException as exc:
+            print(f"    [{index}/{len(sub_urls)}] Request failed for {sub_url}: {exc}")
+            time.sleep(delay_seconds)
+            continue
+
+        if value:
+            print(f"    [{index}/{len(sub_urls)}] {sub_url} -> {value.isoformat()}")
+            if latest_date is None or value > latest_date:
+                latest_date = value
+        else:
+            print(f"    [{index}/{len(sub_urls)}] {sub_url} -> no date found")
+
+        time.sleep(delay_seconds)
+
+    return latest_date
+
+
+# ---------------------------------------------------------------------------
+# Word document helpers
+# ---------------------------------------------------------------------------
 
 def _set_run_font(run, font_name: str = DATE_FONT_NAME, font_size: int = DATE_FONT_SIZE_PT) -> None:
     run.font.name = font_name
@@ -325,6 +454,10 @@ def format_date_column(table) -> None:
         cell = row.cells[DATE_COLUMN_INDEX]
         set_cell_text(cell, cell.text.strip())
 
+
+# ---------------------------------------------------------------------------
+# Main processing
+# ---------------------------------------------------------------------------
 
 def process_document(
     doc_path: Path,
@@ -384,8 +517,17 @@ def process_document(
         print(f"  -> Matched: {link.title!r}")
         print(f"  -> URL: {link.absolute_url}")
 
+        is_special = normalize_title(item.title) in SPECIAL_MULTI_LINK_TITLES
+
         try:
-            new_date = fetch_update_date(session, link.absolute_url)
+            if is_special:
+                print("  -> Special topic: scanning td.table-td.centered links for latest date...")
+                latest_value = fetch_most_recent_date_from_subpages(
+                    session, link.absolute_url, delay_seconds=delay_seconds
+                )
+                new_date = format_bengali_date(latest_value) if latest_value else None
+            else:
+                new_date = fetch_update_date(session, link.absolute_url)
         except requests.RequestException as exc:
             message = f"  -> Request failed: {exc}"
             print(message)
