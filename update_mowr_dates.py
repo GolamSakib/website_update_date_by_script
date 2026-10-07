@@ -93,8 +93,10 @@ MONTHS = {
     "december": 12,
     "dec": 12,
     "জানুয়ারি": 1,
+    "জানুয়ারী": 1,
     "জানু": 1,
     "ফেব্রুয়ারি": 2,
+    "ফেব্রুয়ারী": 2,
     "ফেব্রু": 2,
     "মার্চ": 3,
     "এপ্রিল": 4,
@@ -350,6 +352,16 @@ SPECIAL_MULTI_LINK_TITLES = {
     normalize_title("ফোকাল পয়েন্ট ও অন্যান্য")
 }
 
+# ---------------------------------------------------------------------------
+# URL overrides for entries that share the same title but point to different
+# pages. Keyed by the Bengali number prefix (e.g. "১০.৭.৪") as it appears
+# in the Word table.
+# ---------------------------------------------------------------------------
+URL_OVERRIDES: dict[str, str] = {
+    "১০.৭.৪": "https://cabinet.gov.bd/pages/static-pages/6940329735ce18e1c055ef63",
+    "১০.৮.৪": "https://mowr.gov.bd/pages/static-pages/694032d235ce18e1c0562f95",
+}
+
 
 def fetch_most_recent_date_from_subpages(
     session: requests.Session,
@@ -508,9 +520,20 @@ def process_document(
     for index, item in enumerate(items, start=1):
         print(f"[{index}/{len(items)}] {item.raw_cell_text}")
 
-        link = find_matching_link(item.title, homepage_links)
         date_cell = table.rows[item.row_index].cells[DATE_COLUMN_INDEX]
         old_date = normalize_title(date_cell.text)
+
+        # Check for a hardcoded URL override first (handles duplicate titles).
+        override_url = URL_OVERRIDES.get(item.number_prefix)
+        if override_url:
+            link = SiteLink(
+                title=item.title,
+                href=override_url,
+                absolute_url=override_url,
+            )
+            print(f"  -> Using URL override: {override_url}")
+        else:
+            link = find_matching_link(item.title, homepage_links)
 
         if not link:
             message = f"  -> No matching link for title: {item.title}"
@@ -520,7 +543,8 @@ def process_document(
                 set_cell_text(date_cell, old_date)
             continue
 
-        print(f"  -> Matched: {link.title!r}")
+        if not override_url:
+            print(f"  -> Matched: {link.title!r}")
         print(f"  -> URL: {link.absolute_url}")
 
         is_special = normalize_title(item.title) in SPECIAL_MULTI_LINK_TITLES
