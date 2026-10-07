@@ -139,8 +139,10 @@ def bn_to_en(text: str) -> str:
 
 
 def normalize_title(text: str) -> str:
+    import unicodedata
     text = text.strip()
     text = re.sub(r"\s+", " ", text)
+    text = unicodedata.normalize("NFC", text)
     return text
 
 
@@ -240,13 +242,29 @@ def find_matching_link(title: str, links: list[SiteLink]) -> Optional[SiteLink]:
     return None
 
 
+def _has_real_path(url: str) -> bool:
+    """Return True if a URL has a meaningful path beyond just the domain root."""
+    from urllib.parse import urlparse
+    path = urlparse(url).path.strip("/")
+    return bool(path)
+
+
 def prefer_mowr_link(links: list[SiteLink]) -> SiteLink:
+    # 1st priority: mowr.gov.bd links with an actual path
     internal = [
         link
         for link in links
-        if "mowr.gov.bd" in link.absolute_url and not link.absolute_url.rstrip("/").endswith("mowr.gov.bd")
+        if "mowr.gov.bd" in link.absolute_url and _has_real_path(link.absolute_url)
     ]
-    return internal[0] if internal else links[0]
+    if internal:
+        return internal[0]
+
+    # 2nd priority: any link with an actual path (not just a bare domain root)
+    with_path = [link for link in links if _has_real_path(link.absolute_url)]
+    if with_path:
+        return with_path[0]
+
+    return links[0]
 
 
 # ---------------------------------------------------------------------------
